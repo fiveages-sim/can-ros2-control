@@ -12,6 +12,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  std_msgs
 )
 
 find_package(ament_cmake REQUIRED)
@@ -21,6 +22,8 @@ endforeach()
 
 add_library(${PROJECT_NAME} SHARED
   src/hands/linkerhand/o6_can_hardware.cpp
+  src/hands/linkerhand/o7_can_hardware.cpp
+  src/hands/linkerhand/o7_can_protocol.cpp
   src/hands/freedom/freedom_can_hardware.cpp
   src/hands/inspire/inspire_canfd_hardware.cpp
 )
@@ -48,6 +51,11 @@ install(
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
+)
+
+install(
+  PROGRAMS scripts/o7_tactile_visualizer
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)

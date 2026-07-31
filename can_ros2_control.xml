@@ -9,6 +9,15 @@
       Command frame: 0x01 followed by six raw angle bytes.
     </description>
   </class>
+  <class name="can_ros2_control/O7CanHardware"
+         type="can_ros2_control::O7CanHardware"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      SocketCAN ros2_control hardware interface for LinkerHand O7.
+      Exports position command and position/derived-velocity state interfaces.
+      CAN ID defaults: right hand 0x27, left hand 0x28.
+    </description>
+  </class>
   <class name="can_ros2_control/FreedomCanHardware"
          type="can_ros2_control::FreedomCanHardware"
          base_class_type="hardware_interface::SystemInterface">

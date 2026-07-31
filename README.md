@@ -4,15 +4,16 @@
 
 ## 1. 支持的末端执行器
 
-本包注册 **3 个** `hardware_interface::SystemInterface` 插件（见 `can_ros2_control.xml`）：
+本包注册以下 `hardware_interface::SystemInterface` 插件（见 `can_ros2_control.xml`）：
 
 | 插件 | 产品 | 识别 / 配置 |
 |------|------|-------------|
 | **`O6CanHardware`** | LinkerHand **O6** / **L6** | URDF 6 关节；CAN2.0 标准帧 |
+| **`O7CanHardware`** | LinkerHand **O7** | URDF 7 关节；CAN2.0 标准帧，1 Mbps |
 | **`FreedomCanHardware`** | Freedom **V1**（6-DOF） | URDF 6 关节；CAN2.0 扩展帧 |
 | **`InspireCanfdHardware`** | Inspire **RH56 系列**（E2 / F2） | URDF 6 关节；CAN FD 扩展帧 |
 
-不支持：LinkerHand **O7**、Freedom **V2**、夹爪。
+不支持：Freedom **V2**、夹爪。
 
 关节接口与 xacro 宏由各 `*_description` 包提供；此处仅示硬件插件用法（见 [§3](#3-配置参考)）。
 
@@ -59,7 +60,20 @@ can_ros2_control/
 </ros2_control>
 ```
 
-### 3.3 Inspire RH56（`InspireCanfdHardware`）
+### 3.3 LinkerHand O7（`O7CanHardware`）
+
+O7 使用位置命令接口以及位置、速度状态接口。速度由位置反馈差分计算，不使用
+协议中的无符号速度数据；无符号力矩不导出为 `effort`。
+
+```bash
+ros2 launch basic_joint_controller hand.launch.py \
+  hand:=linkerhand type:=o7 hardware:=real_can direction:=-1
+```
+
+`direction:=-1` 为右手（CAN ID `0x27`），`direction:=1` 为左手（CAN ID
+`0x28`）。SocketCAN 接口默认使用 `can0`。
+
+### 3.4 Inspire RH56（`InspireCanfdHardware`）
 
 ```xml
 <ros2_control name="inspire_e2_left_canfd_system" type="system">
@@ -113,6 +127,11 @@ Inspire 寄存器语义与 [modbus_ros2_control `InspireHandHardware`](https://g
 # O6 / Freedom V1 — 500 kbps
 sudo ip link set can0 down
 sudo ip link set can0 type can bitrate 500000
+sudo ip link set can0 up
+
+# LinkerHand O7 — 1 Mbps
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 1000000
 sudo ip link set can0 up
 
 # Inspire RH56 — CAN FD：1 Mbps / 5 Mbps
