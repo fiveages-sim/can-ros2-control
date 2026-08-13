@@ -66,6 +66,7 @@ hardware_interface::CallbackReturn O6CanHardware::on_init(
   }
 
   load_parameters();
+  declare_tool_parameters();
   upper_limits_ = default_upper_limits(joint_names_);
 
   for (std::size_t i = 0; i < kJointCount; ++i)
@@ -113,6 +114,7 @@ hardware_interface::CallbackReturn O6CanHardware::on_activate(
   }
 
   command_sent_ = false;
+  tool_settings_pending_.store(true);
   position_feedback_initialized_ = false;
   tactile_request_pending_ = false;
   tactile_batch_complete_.fill(false);
@@ -201,6 +203,11 @@ hardware_interface::return_type O6CanHardware::read(
   const rclcpp::Duration& period)
 {
   if (socket_fd_ < 0)
+  {
+    return hardware_interface::return_type::ERROR;
+  }
+
+  if (!send_pending_tool_settings())
   {
     return hardware_interface::return_type::ERROR;
   }
@@ -313,6 +320,23 @@ void O6CanHardware::load_parameters()
     1, parse_int(get_parameter("tactile_timeout_ms", "100"), tactile_timeout_ms_));
   command_deadband_raw_ = std::clamp(parse_int(get_parameter("command_deadband_raw", "0"), 0), 0, 255);
 
+  tool_torque_parameter_name_ =
+    hand_side_ == "left" ? "left_tool_torque" : "right_tool_torque";
+  tool_velocity_parameter_name_ =
+    hand_side_ == "left" ? "left_tool_velocity" : "right_tool_velocity";
+  const auto parse_scale = [&get_parameter](const std::string& name) {
+    try
+    {
+      return std::clamp(std::stod(get_parameter(name, "1.0")), 0.0, 1.0);
+    }
+    catch (const std::exception&)
+    {
+      return 1.0;
+    }
+  };
+  tool_torque_scale_.store(parse_scale(tool_torque_parameter_name_));
+  tool_velocity_scale_.store(parse_scale(tool_velocity_parameter_name_));
+
   const auto can_id_parameter = info_.hardware_parameters.find("can_id");
   if (can_id_parameter != info_.hardware_parameters.end())
   {
@@ -326,6 +350,85 @@ void O6CanHardware::load_parameters()
   {
     can_id_ = kRightHandCanId;
   }
+}
+
+void O6CanHardware::declare_tool_parameters()
+{
+  const auto node = get_node();
+  if (!node)
+  {
+    return;
+  }
+
+  if (!node->has_parameter(tool_torque_parameter_name_))
+  {
+    node->declare_parameter<double>(
+      tool_torque_parameter_name_, tool_torque_scale_.load());
+  }
+  if (!node->has_parameter(tool_velocity_parameter_name_))
+  {
+    node->declare_parameter<double>(
+      tool_velocity_parameter_name_, tool_velocity_scale_.load());
+  }
+
+  parameter_callback_handle_ = node->add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter>& parameters) {
+      return on_tool_parameters(parameters);
+    });
+}
+
+rcl_interfaces::msg::SetParametersResult O6CanHardware::on_tool_parameters(
+  const std::vector<rclcpp::Parameter>& parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+  double next_torque = tool_torque_scale_.load();
+  double next_velocity = tool_velocity_scale_.load();
+  bool changed = false;
+
+  for (const auto& parameter : parameters)
+  {
+    const auto& name = parameter.get_name();
+    if (name != tool_torque_parameter_name_ &&
+        name != tool_velocity_parameter_name_)
+    {
+      continue;
+    }
+    if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE &&
+        parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER)
+    {
+      result.successful = false;
+      result.reason = name + " must be numeric";
+      return result;
+    }
+    const double value =
+      parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
+        ? static_cast<double>(parameter.as_int())
+        : parameter.as_double();
+    if (value < 0.0 || value > 1.0)
+    {
+      result.successful = false;
+      result.reason = name + " must be in [0.0, 1.0]";
+      return result;
+    }
+
+    if (name == tool_torque_parameter_name_)
+    {
+      next_torque = value;
+    }
+    else
+    {
+      next_velocity = value;
+    }
+    changed = true;
+  }
+  if (changed)
+  {
+    tool_torque_scale_.store(next_torque);
+    tool_velocity_scale_.store(next_velocity);
+    tool_settings_pending_.store(true);
+  }
+  return result;
 }
 
 bool O6CanHardware::validate_joint_interfaces() const
@@ -715,6 +818,79 @@ bool O6CanHardware::send_command(const std::array<uint8_t, kJointCount>& raw_com
     return false;
   }
 
+  return true;
+}
+
+bool O6CanHardware::send_joint_setting(
+  uint8_t command, const std::array<uint8_t, kJointCount>& values)
+{
+  struct can_frame frame;
+  std::memset(&frame, 0, sizeof(frame));
+  frame.can_id = can_id_;
+  frame.can_dlc = kJointCount + 1;
+  frame.data[0] = command;
+  std::copy(values.begin(), values.end(), frame.data + 1);
+
+  const auto bytes_written = ::write(socket_fd_, &frame, sizeof(frame));
+  if (bytes_written != static_cast<ssize_t>(sizeof(frame)))
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLoggerName),
+      "Failed to write O6 setting 0x%02X to ID 0x%X: %s",
+      command, can_id_, std::strerror(errno));
+    return false;
+  }
+  return true;
+}
+
+bool O6CanHardware::send_pending_tool_settings()
+{
+  if (!tool_settings_pending_.exchange(false))
+  {
+    return true;
+  }
+
+  const auto to_raw = [](double scale) {
+    return static_cast<uint8_t>(
+      std::lround(std::clamp(scale, 0.0, 1.0) * 255.0));
+  };
+  std::array<uint8_t, kJointCount> torques{};
+  std::array<uint8_t, kJointCount> velocities{};
+  torques.fill(to_raw(tool_torque_scale_.load()));
+  velocities.fill(to_raw(tool_velocity_scale_.load()));
+
+  if (!send_joint_setting(kMaxTorqueCommand, torques))
+  {
+    tool_settings_pending_.store(true);
+    return false;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(6));
+  if (!send_joint_setting(kMaxTorqueCommand, torques))
+  {
+    tool_settings_pending_.store(true);
+    return false;
+  }
+
+  // The O6 vendor CAN implementation sends command 0x05 twice. A single
+  // speed frame can be lost when it is adjacent to another request, even
+  // though SocketCAN accepted the write. The vendor loop has a 1 ms pre-send
+  // delay plus send_frame()'s 5 ms delay, so preserve the effective 6 ms gap.
+  if (!send_joint_setting(kMaxVelocityCommand, velocities))
+  {
+    tool_settings_pending_.store(true);
+    return false;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(6));
+  if (!send_joint_setting(kMaxVelocityCommand, velocities))
+  {
+    tool_settings_pending_.store(true);
+    return false;
+  }
+
+  RCLCPP_INFO(
+    rclcpp::get_logger(kLoggerName),
+    "Applied O6 %s tool limits: torque=%u, velocity=%u",
+    hand_side_.c_str(), torques.front(), velocities.front());
   return true;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <hardware_interface/types/hardware_interface_return_values.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/state.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <std_msgs/msg/u_int8_multi_array.hpp>
 
 #include "can_ros2_control/hands/linkerhand/o7_can_protocol.h"
@@ -55,6 +57,8 @@ private:
   static constexpr uint32_t kRightHandCanId = 0x27;
   static constexpr uint32_t kLeftHandCanId = 0x28;
   static constexpr uint8_t kAngleCommand = 0x01;
+  static constexpr uint8_t kMaxTorqueCommand = 0x02;
+  static constexpr uint8_t kMaxVelocityCommand = 0x05;
   // O6 selector 0xA4 requests a 10-row x 4-column tactile matrix.
   static constexpr uint8_t kTactileLayout10x4 = 0xA4;
   static constexpr std::size_t kTactileRows = 10;
@@ -68,12 +72,18 @@ private:
     std::array<std::array<uint8_t, kTactileColumns>, kTactileRows>;
 
   void load_parameters();
+  void declare_tool_parameters();
+  rcl_interfaces::msg::SetParametersResult on_tool_parameters(
+    const std::vector<rclcpp::Parameter>& parameters);
   bool validate_joint_interfaces() const;
   bool open_socket();
   void close_socket();
   bool receive_feedback(const rclcpp::Duration& period);
   bool send_position_read_request();
   bool send_command(const std::array<uint8_t, kJointCount>& raw_command);
+  bool send_joint_setting(
+    uint8_t command, const std::array<uint8_t, kJointCount>& values);
+  bool send_pending_tool_settings();
   bool send_tactile_request(Finger finger);
   void schedule_tactile_request();
   bool process_tactile_frame(const struct can_frame& frame);
@@ -107,6 +117,13 @@ private:
   int feedback_timeout_ms_ = 1;
   int tactile_timeout_ms_ = 100;
   int command_deadband_raw_ = 0;
+  std::string tool_torque_parameter_name_;
+  std::string tool_velocity_parameter_name_;
+  std::atomic<double> tool_torque_scale_{1.0};
+  std::atomic<double> tool_velocity_scale_{1.0};
+  std::atomic_bool tool_settings_pending_{true};
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+    parameter_callback_handle_;
 
   int socket_fd_ = -1;
   bool command_sent_ = false;

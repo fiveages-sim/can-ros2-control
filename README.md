@@ -193,6 +193,10 @@ cansend can0 027#B1A4
 | | `feedback_timeout_ms` | `1` | |
 | | `tactile_timeout_ms` | `100` | 触觉批次超时后重新发起五指请求 |
 | | `command_deadband_raw` | `0` | 0–255 |
+| | `left_tool_torque` / `right_tool_torque` | `1.0` | 按 `hand_side` 声明对应参数；运行时设置 O6 最大扭矩，归一化到 0–255 |
+| | `left_tool_velocity` / `right_tool_velocity` | `1.0` | 按 `hand_side` 声明对应参数；运行时设置 O6 最大速度，归一化到 0–255 |
+
+O6 的扭矩配置帧 `0x02` 和速度配置帧 `0x05` 均连续发送两次，帧间隔 6 ms，避免与相邻查询帧冲突时设备漏写。
 | **O7CanHardware** | `can_interface` | `can0` | SocketCAN 接口名 |
 | | `hand_side` | `right` | `left` → `0x28`，`right` → `0x27` |
 | | `can_id` | — | 可选，覆盖由 `hand_side` 推导的 ID |

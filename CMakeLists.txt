@@ -11,6 +11,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   hardware_interface
   pluginlib
   rclcpp
+  rcl_interfaces
   rclcpp_lifecycle
   std_msgs
 )
