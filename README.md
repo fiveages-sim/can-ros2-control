@@ -29,7 +29,7 @@ can_ros2_control/
 │   ├── linkerhand/o7_can_protocol.cpp
 │   ├── freedom/freedom_can_hardware.cpp
 │   └── inspire/inspire_canfd_hardware.cpp
-├── scripts/o7_tactile_visualizer
+├── scripts/linkerhand_tactile_visualizer
 └── can_ros2_control.xml
 ```
 
@@ -77,15 +77,20 @@ ros2 launch basic_joint_controller hand.launch.py \
 `direction:=-1` 为右手（CAN ID `0x27`），`direction:=1` 为左手（CAN ID
 `0x28`）。SocketCAN 接口默认使用 `can0`。
 
-#### O7 触觉反馈
+#### O6 / O7 触觉反馈
 
-带触觉版本的 O7 可通过同一条 CAN 总线读取五指触觉阵列。启动时必须显式传入
+带触觉版本的 O6 和 O7 可通过同一条 CAN 总线读取五指触觉阵列。启动时必须显式传入
 `read_tactile:=true`：
 
 ```bash
 # 右手（CAN ID 0x27）
 ros2 launch basic_joint_controller hand.launch.py \
   hand:=linkerhand type:=o7 hardware:=real_can direction:=-1 \
+  can_interface:=can0 read_tactile:=true
+
+# O6 右手（CAN ID 0x27）；左手同样使用 direction:=1
+ros2 launch basic_joint_controller hand.launch.py \
+  hand:=linkerhand type:=o6 hardware:=real_can direction:=-1 \
   can_interface:=can0 read_tactile:=true
 
 # 左手（CAN ID 0x28）
@@ -108,10 +113,10 @@ ros2 launch basic_joint_controller hand.launch.py \
 | 无名指 | `tactile/ring` |
 | 小指 | `tactile/pinky` |
 
-完整话题名称为 `/o7_hand/<left|right>/tactile/<finger>`。每条消息是一张
-`12 × 6` 的无符号 8 位触觉矩阵，共 72 个值；`layout.dim` 顺序为 `row`、
-`column`，`data` 按行优先排列。只有收齐一根手指的 12 个响应帧后才发布该指
-的完整矩阵。
+完整话题名称为 `/<o6|o7>_hand/<left|right>/tactile/<finger>`。O6 每条消息是
+`10 × 4` 矩阵（40 个值），O7 是 `12 × 6` 矩阵（72 个值）；元素均为无符号
+8 位整数。`layout.dim` 顺序为 `row`、`column`，`data` 按行优先排列。只有
+收齐一根手指的完整响应后才发布该指矩阵。
 
 检查话题和采样率：
 
@@ -125,20 +130,25 @@ ros2 topic echo /o7_hand/right/tactile/thumb --once
 
 ```bash
 # 右手
-ros2 run can_ros2_control o7_tactile_visualizer \
+ros2 run can_ros2_control linkerhand_tactile_visualizer \
   --ros-args -p hand_side:=right
 
 # 左手
-ros2 run can_ros2_control o7_tactile_visualizer \
+ros2 run can_ros2_control linkerhand_tactile_visualizer \
   --ros-args -p hand_side:=left
+
+# O6 右手
+ros2 run can_ros2_control linkerhand_tactile_visualizer \
+  --ros-args -p hand_model:=o6 -p hand_side:=right
 ```
 
-可选参数：`topic_prefix`（默认 `/o7_hand`）、`refresh_rate`（默认 20 Hz）和
+可选参数：`hand_model`（`o6` 或 `o7`，默认 `o7`）、`topic_prefix`（默认根据
+`hand_model` 选择 `/o6_hand` 或 `/o7_hand`）、`refresh_rate`（默认 20 Hz）和
 `color_max`（默认 255）。该工具依赖 `python3-matplotlib` 和 `python3-numpy`。
 
-触觉协议使用 `0xB1`～`0xB5` 分别请求拇指到小指，`0xC6` 选择 12×6
-矩阵。一次单指请求应返回 12 个 DLC=8 的响应帧。安装 `can-utils` 后可绕过
-ROS 进行原始总线自检：
+触觉协议使用 `0xB1`～`0xB5` 分别请求拇指到小指。第二字节 O6 使用 `0xA4`，
+返回 10 个 DLC=6 帧并组成 10×4 矩阵；O7 使用 `0xC6`，返回 12 个 DLC=8
+帧并组成 12×6 矩阵。安装 `can-utils` 后可绕过 ROS 进行原始总线自检：
 
 ```bash
 sudo apt install can-utils
@@ -147,7 +157,10 @@ sudo apt install can-utils
 candump -tz can0,027:7FF
 
 # 终端 2：请求右手拇指触觉
+# O7
 cansend can0 027#B1C6
+# O6
+cansend can0 027#B1A4
 ```
 
 正常响应的命令字为 `B1`，坐标字节依次为 `00`、`10`、...、`B0`。
@@ -176,7 +189,9 @@ cansend can0 027#B1C6
 | | `hand_side` | `right` | `left` → `0x28`，`right` → `0x27` |
 | | `can_id` | — | 可选，覆盖默认 ID |
 | | `read_feedback` | `true` | |
+| | `read_tactile` | `false` | 启用五指 12×6 触觉读取与 ROS 话题 |
 | | `feedback_timeout_ms` | `1` | |
+| | `tactile_timeout_ms` | `100` | 触觉批次超时后重新发起五指请求 |
 | | `command_deadband_raw` | `0` | 0–255 |
 | **O7CanHardware** | `can_interface` | `can0` | SocketCAN 接口名 |
 | | `hand_side` | `right` | `left` → `0x28`，`right` → `0x27` |
@@ -208,7 +223,7 @@ cansend can0 027#B1C6
 
 | 末端 | 总线 | ROS2 Control | 设备侧 |
 |------|------|--------------|--------|
-| LinkerHand O6/L6 | CAN2.0 标准帧 | 弧度（rad） | `0x01` + 6 字节；`255`=伸，`0`=弯 |
+| LinkerHand O6/L6 | CAN2.0 标准帧 | 弧度（rad）；触觉为 `UInt8MultiArray` | `0x01` + 6 字节；`255`=伸，`0`=弯；触觉 `0xB1`～`0xB5` |
 | LinkerHand O7 | CAN2.0 标准帧 | 弧度（rad）；触觉为 `UInt8MultiArray` | `0x01` + 7 字节；触觉 `0xB1`～`0xB5` |
 | Freedom V1 | CAN2.0 扩展帧 | 弧度（rad） | Freedom 分片运动帧 |
 | Inspire RH56 | CAN FD 扩展帧 | 弧度（rad） | 寄存器 `1040`/`1064` 等；限位当前为 RH56E2 |
@@ -218,12 +233,12 @@ Inspire 寄存器语义与 [modbus_ros2_control `InspireHandHardware`](https://g
 ## 6. SocketCAN 准备
 
 ```bash
-# O6 / Freedom V1 — 500 kbps
+# Freedom V1 — 500 kbps
 sudo ip link set can0 down
 sudo ip link set can0 type can bitrate 500000
 sudo ip link set can0 up
 
-# LinkerHand O7 — 1 Mbps
+# LinkerHand O6 / O7 — 1 Mbps
 sudo ip link set can0 down
 sudo ip link set can0 type can bitrate 1000000
 sudo ip link set can0 up
@@ -254,11 +269,12 @@ ros2 launch basic_joint_controller hand.launch.py \
   hand:=inspire type:=RH56E2 hardware:=real_can direction:=1
 ```
 
-### 7.1 O7 触觉故障排查
+### 7.1 O6 / O7 触觉故障排查
 
 1. 启动日志必须包含 `feedback=true, tactile=true`。
 2. `/joint_states` 有数据但没有触觉话题：检查 `read_tactile` 是否传入 Xacro。
-3. 有触觉话题但没有消息：用 `candump` 检查是否发出 `B1 C6`～`B5 C6`，
+3. 有触觉话题但没有消息：用 `candump` 检查 O6 是否发出 `B1 A4`～`B5 A4`、
+   O7 是否发出 `B1 C6`～`B5 C6`，
    以及每根手指是否返回完整 12 帧。
 4. 手动 `cansend` 有响应但 ROS 无消息：核对响应 DLC 是否为 8、命令字是否为
    `B1`～`B5`、坐标是否为 `00`～`B0`。当前解析器会拒绝格式不符的帧。

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Display the five O7 tactile matrices as live heatmaps."""
+"""Display the five LinkerHand O6/O7 tactile matrices as live heatmaps."""
 
 import threading
 import time
@@ -23,19 +23,15 @@ FINGER_LABELS = {
     "ring": "Ring",
     "pinky": "Pinky",
 }
-ROWS = 12
-COLUMNS = 6
-POINT_COUNT = ROWS * COLUMNS
-
-
-class O7TactileVisualizer(Node):
-    """Receive complete O7 tactile matrices and retain the latest samples."""
+class LinkerHandTactileVisualizer(Node):
+    """Receive complete O6/O7 tactile matrices and retain the latest samples."""
 
     def __init__(self) -> None:
-        super().__init__("o7_tactile_visualizer")
+        super().__init__("linkerhand_tactile_visualizer")
 
         self.declare_parameter("hand_side", "right")
-        self.declare_parameter("topic_prefix", "/o7_hand")
+        self.declare_parameter("hand_model", "o7")
+        self.declare_parameter("topic_prefix", "")
         self.declare_parameter("refresh_rate", 20.0)
         self.declare_parameter("color_max", 255.0)
 
@@ -45,11 +41,21 @@ class O7TactileVisualizer(Node):
         if self.hand_side not in ("left", "right"):
             raise ValueError("hand_side must be 'left' or 'right'")
 
+        self.hand_model = (
+            self.get_parameter("hand_model").get_parameter_value().string_value.lower()
+        )
+        if self.hand_model not in ("o6", "o7"):
+            raise ValueError("hand_model must be 'o6' or 'o7'")
+        self.rows, self.columns = (10, 4) if self.hand_model == "o6" else (12, 6)
+        self.point_count = self.rows * self.columns
+
         prefix = (
             self.get_parameter("topic_prefix")
             .get_parameter_value()
             .string_value.rstrip("/")
         )
+        if not prefix:
+            prefix = f"/{self.hand_model}_hand"
         self.refresh_rate = max(
             1.0,
             self.get_parameter("refresh_rate").get_parameter_value().double_value,
@@ -61,7 +67,7 @@ class O7TactileVisualizer(Node):
 
         self.lock = threading.Lock()
         self.matrices = {
-            finger: np.zeros((ROWS, COLUMNS), dtype=np.uint8)
+            finger: np.zeros((self.rows, self.columns), dtype=np.uint8)
             for finger in FINGERS
         }
         self.last_sample_time = {finger: None for finger in FINGERS}
@@ -86,16 +92,18 @@ class O7TactileVisualizer(Node):
             self.get_logger().info(f"Subscribing to {topic}")
 
     def tactile_callback(self, finger: str, message: UInt8MultiArray) -> None:
-        if len(message.data) != POINT_COUNT:
+        if len(message.data) != self.point_count:
             self.get_logger().warning(
                 f"Ignoring {finger} matrix with {len(message.data)} values; "
-                f"expected {POINT_COUNT}",
+                f"expected {self.point_count}",
                 throttle_duration_sec=2.0,
             )
             return
 
         now = time.monotonic()
-        matrix = np.asarray(message.data, dtype=np.uint8).reshape(ROWS, COLUMNS)
+        matrix = np.asarray(message.data, dtype=np.uint8).reshape(
+            self.rows, self.columns
+        )
         with self.lock:
             previous = self.last_sample_time[finger]
             if previous is not None and now > previous:
@@ -119,7 +127,7 @@ class O7TactileVisualizer(Node):
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = O7TactileVisualizer()
+    node = LinkerHandTactileVisualizer()
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -127,14 +135,16 @@ def main(args=None) -> None:
 
     figure, axes = plt.subplots(1, len(FINGERS), figsize=(13, 6), sharey=True)
     figure.canvas.manager.set_window_title(
-        f"O7 {node.hand_side.capitalize()} Hand Tactile"
+        f"{node.hand_model.upper()} {node.hand_side.capitalize()} Hand Tactile"
     )
-    figure.suptitle(f"O7 {node.hand_side.capitalize()} Hand Tactile Matrices")
+    figure.suptitle(
+        f"{node.hand_model.upper()} {node.hand_side.capitalize()} Hand Tactile Matrices"
+    )
 
     images = {}
     for axis, finger in zip(axes, FINGERS):
         images[finger] = axis.imshow(
-            np.zeros((ROWS, COLUMNS), dtype=np.uint8),
+            np.zeros((node.rows, node.columns), dtype=np.uint8),
             cmap="inferno",
             vmin=0,
             vmax=node.color_max,
@@ -144,8 +154,8 @@ def main(args=None) -> None:
         )
         axis.set_title(f"{FINGER_LABELS[finger]}\nwaiting")
         axis.set_xlabel("Column")
-        axis.set_xticks(range(COLUMNS))
-        axis.set_yticks(range(ROWS))
+        axis.set_xticks(range(node.columns))
+        axis.set_yticks(range(node.rows))
     axes[0].set_ylabel("Row")
     figure.colorbar(
         images[FINGERS[-1]],

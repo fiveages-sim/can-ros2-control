@@ -54,7 +54,7 @@ install(
 )
 
 install(
-  PROGRAMS scripts/o7_tactile_visualizer
+  PROGRAMS scripts/linkerhand_tactile_visualizer
   DESTINATION lib/${PROJECT_NAME}
 )
 

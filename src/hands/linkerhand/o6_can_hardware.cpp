@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
+#include <std_msgs/msg/multi_array_dimension.hpp>
 
 namespace can_ros2_control
 {
@@ -78,13 +79,27 @@ hardware_interface::CallbackReturn O6CanHardware::on_init(
     last_raw_command_[i] = radians_to_raw(hw_commands_[i], i);
   }
 
+  if (read_tactile_)
+  {
+    for (std::size_t index = 0; index < kFingerCount; ++index)
+    {
+      const auto finger = static_cast<Finger>(index);
+      const std::string topic =
+        "/o6_hand/" + hand_side_ + "/tactile/" + finger_name(finger);
+      tactile_publishers_[index] =
+        get_node()->create_publisher<std_msgs::msg::UInt8MultiArray>(topic, 10);
+    }
+  }
+
   RCLCPP_INFO(
     rclcpp::get_logger(kLoggerName),
-    "Configured O6 CAN hardware: interface=%s, side=%s, can_id=0x%X, feedback=%s",
+    "Configured O6 CAN hardware: interface=%s, side=%s, can_id=0x%X, "
+    "feedback=%s, tactile=%s",
     can_interface_.c_str(),
     hand_side_.c_str(),
     can_id_,
-    read_feedback_ ? "true" : "false");
+    read_feedback_ ? "true" : "false",
+    read_tactile_ ? "true" : "false");
 
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -98,6 +113,13 @@ hardware_interface::CallbackReturn O6CanHardware::on_activate(
   }
 
   command_sent_ = false;
+  position_feedback_initialized_ = false;
+  tactile_request_pending_ = false;
+  tactile_batch_complete_.fill(false);
+  for (std::size_t index = 0; index < kFingerCount; ++index)
+  {
+    reset_tactile(static_cast<Finger>(index));
+  }
   for (std::size_t i = 0; i < kJointCount; ++i)
   {
     hw_commands_[i] = hw_positions_[i];
@@ -185,16 +207,31 @@ hardware_interface::return_type O6CanHardware::read(
 
   previous_positions_ = hw_positions_;
 
-  if (read_feedback_)
+  if (read_feedback_ && !send_position_read_request())
+  {
+    return hardware_interface::return_type::ERROR;
+  }
+
+  if (read_tactile_)
+  {
+    schedule_tactile_request();
+  }
+
+  if (read_feedback_ || read_tactile_)
   {
     if (!receive_feedback(period))
     {
       return hardware_interface::return_type::ERROR;
     }
   }
-  else
+  if (!read_feedback_)
   {
     hw_positions_ = hw_commands_;
+  }
+
+  if (read_tactile_)
+  {
+    schedule_tactile_request();
   }
 
   const double dt = period.seconds();
@@ -216,6 +253,14 @@ hardware_interface::return_type O6CanHardware::write(
   if (socket_fd_ < 0)
   {
     return hardware_interface::return_type::ERROR;
+  }
+
+  // Wait for the first real position sample before allowing ros2_control to
+  // transmit. Otherwise the URDF's zero initial values make the hand jump to
+  // zero during startup.
+  if (read_feedback_ && !position_feedback_initialized_)
+  {
+    return hardware_interface::return_type::OK;
   }
 
   std::array<uint8_t, kJointCount> raw_command{};
@@ -257,10 +302,15 @@ void O6CanHardware::load_parameters()
   hand_side_ = get_parameter("hand_side", hand_side_);
   hand_type_ = get_parameter("hand_type", hand_type_);
   read_feedback_ = parse_bool(get_parameter("read_feedback", read_feedback_ ? "true" : "false"), read_feedback_);
+  read_tactile_ = parse_bool(
+    get_parameter("read_tactile", read_tactile_ ? "true" : "false"),
+    read_tactile_);
   send_initial_command_ = parse_bool(
     get_parameter("send_initial_command", send_initial_command_ ? "true" : "false"),
     send_initial_command_);
   feedback_timeout_ms_ = std::max(0, parse_int(get_parameter("feedback_timeout_ms", "1"), feedback_timeout_ms_));
+  tactile_timeout_ms_ = std::max(
+    1, parse_int(get_parameter("tactile_timeout_ms", "100"), tactile_timeout_ms_));
   command_deadband_raw_ = std::clamp(parse_int(get_parameter("command_deadband_raw", "0"), 0), 0, 255);
 
   const auto can_id_parameter = info_.hardware_parameters.find("can_id");
@@ -381,7 +431,7 @@ bool O6CanHardware::receive_feedback(const rclcpp::Duration& period)
 {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(feedback_timeout_ms_);
-  bool processed_frame = false;
+  bool processed_position_frame = false;
 
   while (true)
   {
@@ -396,13 +446,33 @@ bool O6CanHardware::receive_feedback(const rclcpp::Duration& period)
       }
 
       const auto frame_id = frame.can_id & CAN_SFF_MASK;
+      if (frame_id == can_id_ && read_tactile_ && process_tactile_frame(frame))
+      {
+        continue;
+      }
       if (frame_id == can_id_ && frame.can_dlc >= kJointCount + 1 && frame.data[0] == kAngleCommand)
       {
         for (std::size_t i = 0; i < kJointCount; ++i)
         {
           hw_positions_[i] = raw_to_radians(frame.data[i + 1], i);
         }
-        processed_frame = true;
+        if (!position_feedback_initialized_)
+        {
+          // Seed both the command and velocity baseline from hardware. The
+          // controller therefore starts by holding the measured pose.
+          hw_commands_ = hw_positions_;
+          previous_positions_ = hw_positions_;
+          hw_velocities_.fill(0.0);
+          for (std::size_t i = 0; i < kJointCount; ++i)
+          {
+            last_raw_command_[i] = frame.data[i + 1];
+          }
+          position_feedback_initialized_ = true;
+          RCLCPP_INFO(
+            rclcpp::get_logger(kLoggerName),
+            "Initialized O6 commands from the first position feedback frame");
+        }
+        processed_position_frame = true;
       }
       continue;
     }
@@ -434,12 +504,7 @@ bool O6CanHardware::receive_feedback(const rclcpp::Duration& period)
     break;
   }
 
-  if (!processed_frame && !command_sent_)
-  {
-    hw_positions_ = hw_commands_;
-  }
-
-  if (!processed_frame && period.seconds() > 0.0)
+  if (!processed_position_frame && period.seconds() > 0.0)
   {
     RCLCPP_DEBUG_THROTTLE(
       rclcpp::get_logger(kLoggerName),
@@ -450,6 +515,180 @@ bool O6CanHardware::receive_feedback(const rclcpp::Duration& period)
   }
 
   return true;
+}
+
+bool O6CanHardware::send_position_read_request()
+{
+  struct can_frame frame;
+  std::memset(&frame, 0, sizeof(frame));
+  frame.can_id = can_id_;
+  frame.can_dlc = 1;
+  frame.data[0] = kAngleCommand;
+
+  if (::write(socket_fd_, &frame, sizeof(frame)) !=
+      static_cast<ssize_t>(sizeof(frame)))
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLoggerName),
+      "Failed to write O6 position request to ID 0x%X: %s",
+      can_id_, std::strerror(errno));
+    return false;
+  }
+  return true;
+}
+
+bool O6CanHardware::send_tactile_request(Finger finger)
+{
+  auto request = O7CanProtocol::make_tactile_read_request(can_id_, finger);
+  request.data[1] = kTactileLayout10x4;
+  struct can_frame frame;
+  std::memset(&frame, 0, sizeof(frame));
+  frame.can_id = request.can_id;
+  frame.can_dlc = request.dlc;
+  std::copy_n(request.data.begin(), request.dlc, frame.data);
+
+  if (::write(socket_fd_, &frame, sizeof(frame)) !=
+      static_cast<ssize_t>(sizeof(frame)))
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLoggerName),
+      "Failed to write O6 tactile request 0x%02X to ID 0x%X: %s",
+      request.data[0], request.can_id, std::strerror(errno));
+    return false;
+  }
+  return true;
+}
+
+void O6CanHardware::schedule_tactile_request()
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (tactile_request_pending_)
+  {
+    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - tactile_request_time_);
+    if (age.count() <= tactile_timeout_ms_)
+    {
+      return;
+    }
+    tactile_request_pending_ = false;
+  }
+
+  tactile_batch_complete_.fill(false);
+  for (std::size_t index = 0; index < kFingerCount; ++index)
+  {
+    reset_tactile(static_cast<Finger>(index));
+  }
+  for (std::size_t index = 0; index < kFingerCount; ++index)
+  {
+    if (!send_tactile_request(static_cast<Finger>(index)))
+    {
+      return;
+    }
+  }
+  tactile_request_time_ = now;
+  tactile_request_pending_ = true;
+}
+
+bool O6CanHardware::process_tactile_frame(const struct can_frame& socket_frame)
+{
+  O7CanProtocol::Frame frame;
+  frame.can_id = socket_frame.can_id & CAN_SFF_MASK;
+  frame.dlc = std::min<uint8_t>(socket_frame.can_dlc, 8);
+  std::copy_n(socket_frame.data, frame.dlc, frame.data.begin());
+
+  Finger finger;
+  if (!O7CanProtocol::finger_from_tactile_command(frame.data[0], finger))
+  {
+    return false;
+  }
+
+  if (frame.can_id != can_id_ || frame.dlc != kTactileResponseDlc)
+  {
+    return false;
+  }
+
+  const uint8_t coordinate = frame.data[1];
+  const uint8_t row = static_cast<uint8_t>((coordinate >> 4) & 0x0F);
+  const uint8_t column = static_cast<uint8_t>(coordinate & 0x0F);
+  if (row >= kTactileRows || column >= kTactileColumns ||
+      static_cast<std::size_t>(column) + kTactileValuesPerFrame >
+        kTactileColumns)
+  {
+    return false;
+  }
+
+  const auto finger_index = static_cast<std::size_t>(finger);
+  auto& state = tactile_states_[finger_index];
+  std::copy_n(
+    frame.data.begin() + 2, kTactileValuesPerFrame,
+    state.matrix[row].begin() + column);
+  if (!state.received_rows[row])
+  {
+    state.received_rows[row] = true;
+    ++state.received_frame_count;
+  }
+
+  if (state.received_frame_count == kTactileFramesPerRequest &&
+      !tactile_batch_complete_[finger_index])
+  {
+    tactile_batch_complete_[finger_index] = true;
+    publish_tactile(finger);
+    if (std::all_of(
+          tactile_batch_complete_.begin(), tactile_batch_complete_.end(),
+          [](bool complete) { return complete; }))
+    {
+      tactile_request_pending_ = false;
+    }
+  }
+  return true;
+}
+
+void O6CanHardware::reset_tactile(Finger finger)
+{
+  auto& state = tactile_states_[static_cast<std::size_t>(finger)];
+  for (auto& row : state.matrix)
+  {
+    row.fill(0);
+  }
+  state.received_rows.fill(false);
+  state.received_frame_count = 0;
+}
+
+void O6CanHardware::publish_tactile(Finger finger)
+{
+  const auto index = static_cast<std::size_t>(finger);
+  if (!tactile_publishers_[index])
+  {
+    return;
+  }
+
+  std_msgs::msg::UInt8MultiArray message;
+  message.layout.dim.resize(2);
+  message.layout.dim[0].label = "row";
+  message.layout.dim[0].size = kTactileRows;
+  message.layout.dim[0].stride = kTactilePointCount;
+  message.layout.dim[1].label = "column";
+  message.layout.dim[1].size = kTactileColumns;
+  message.layout.dim[1].stride = kTactileColumns;
+  message.data.reserve(kTactilePointCount);
+  for (const auto& row : tactile_states_[index].matrix)
+  {
+    message.data.insert(message.data.end(), row.begin(), row.end());
+  }
+  tactile_publishers_[index]->publish(message);
+}
+
+const char* O6CanHardware::finger_name(Finger finger)
+{
+  switch (finger)
+  {
+    case Finger::kThumb: return "thumb";
+    case Finger::kIndex: return "index";
+    case Finger::kMiddle: return "middle";
+    case Finger::kRing: return "ring";
+    case Finger::kPinky: return "pinky";
+  }
+  return "unknown";
 }
 
 bool O6CanHardware::send_command(const std::array<uint8_t, kJointCount>& raw_command)
