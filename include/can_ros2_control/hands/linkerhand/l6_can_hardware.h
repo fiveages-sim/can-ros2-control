@@ -5,10 +5,10 @@
 namespace can_ros2_control
 {
 
-class O6CanHardware final : public LinkerHandCanHardware
+class L6CanHardware final : public LinkerHandCanHardware
 {
 public:
-  O6CanHardware();
+  L6CanHardware();
 };
 
 }  // namespace can_ros2_control

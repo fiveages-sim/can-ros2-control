@@ -22,9 +22,10 @@ foreach(Dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
 endforeach()
 
 add_library(${PROJECT_NAME} SHARED
+  src/hands/linkerhand/linkerhand_can_hardware.cpp
+  src/hands/linkerhand/l6_can_hardware.cpp
   src/hands/linkerhand/o6_can_hardware.cpp
   src/hands/linkerhand/o7_can_hardware.cpp
-  src/hands/linkerhand/o7_can_protocol.cpp
   src/hands/freedom/freedom_can_hardware.cpp
   src/hands/inspire/inspire_canfd_hardware.cpp
 )

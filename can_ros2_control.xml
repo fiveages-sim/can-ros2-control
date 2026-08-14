@@ -18,6 +18,14 @@
       CAN ID defaults: right hand 0x27, left hand 0x28.
     </description>
   </class>
+  <class name="can_ros2_control/L6CanHardware"
+         type="can_ros2_control::L6CanHardware"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      SocketCAN ros2_control hardware interface for LinkerHand L6.
+      Uses the shared six-joint motion protocol and the L6 12x6 tactile layout.
+    </description>
+  </class>
   <class name="can_ros2_control/FreedomCanHardware"
          type="can_ros2_control::FreedomCanHardware"
          base_class_type="hardware_interface::SystemInterface">
