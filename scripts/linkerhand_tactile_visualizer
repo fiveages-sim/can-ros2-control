@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+
+"""Display the five LinkerHand O6/L6/O7 tactile matrices as live heatmaps."""
+
+import threading
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import rclpy
+from matplotlib.animation import FuncAnimation
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import UInt8MultiArray
+
+
+FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+FINGER_LABELS = {
+    "thumb": "Thumb",
+    "index": "Index",
+    "middle": "Middle",
+    "ring": "Ring",
+    "pinky": "Pinky",
+}
+class LinkerHandTactileVisualizer(Node):
+    """Receive complete O6/L6/O7 tactile matrices and retain the latest samples."""
+
+    def __init__(self) -> None:
+        super().__init__("linkerhand_tactile_visualizer")
+
+        self.declare_parameter("hand_side", "right")
+        self.declare_parameter("hand_model", "o7")
+        self.declare_parameter("topic_prefix", "")
+        self.declare_parameter("refresh_rate", 20.0)
+        self.declare_parameter("color_max", 255.0)
+
+        self.hand_side = (
+            self.get_parameter("hand_side").get_parameter_value().string_value
+        )
+        if self.hand_side not in ("left", "right"):
+            raise ValueError("hand_side must be 'left' or 'right'")
+
+        self.hand_model = (
+            self.get_parameter("hand_model").get_parameter_value().string_value.lower()
+        )
+        if self.hand_model not in ("o6", "l6", "o7"):
+            raise ValueError("hand_model must be 'o6', 'l6', or 'o7'")
+        message_dimensions = {"o6": (10, 4), "l6": (12, 6), "o7": (12, 6)}
+        self.message_rows, self.message_columns = message_dimensions[self.hand_model]
+        self.rows, self.columns = self.message_rows, self.message_columns
+        self.point_count = self.message_rows * self.message_columns
+
+        prefix = (
+            self.get_parameter("topic_prefix")
+            .get_parameter_value()
+            .string_value.rstrip("/")
+        )
+        if not prefix:
+            prefix = f"/{self.hand_model}_hand"
+        self.refresh_rate = max(
+            1.0,
+            self.get_parameter("refresh_rate").get_parameter_value().double_value,
+        )
+        self.color_max = max(
+            1.0,
+            self.get_parameter("color_max").get_parameter_value().double_value,
+        )
+
+        self.lock = threading.Lock()
+        self.matrices = {
+            finger: np.zeros((self.rows, self.columns), dtype=np.uint8)
+            for finger in FINGERS
+        }
+        self.last_sample_time = {finger: None for finger in FINGERS}
+        self.rates = {finger: 0.0 for finger in FINGERS}
+
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._tactile_subscriptions = []
+        for finger in FINGERS:
+            topic = f"{prefix}/{self.hand_side}/tactile/{finger}"
+            self._tactile_subscriptions.append(
+                self.create_subscription(
+                    UInt8MultiArray,
+                    topic,
+                    lambda message, name=finger: self.tactile_callback(name, message),
+                    qos,
+                )
+            )
+            self.get_logger().info(f"Subscribing to {topic}")
+
+    def tactile_callback(self, finger: str, message: UInt8MultiArray) -> None:
+        if len(message.data) != self.point_count:
+            self.get_logger().warning(
+                f"Ignoring {finger} matrix with {len(message.data)} values; "
+                f"expected {self.point_count}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        now = time.monotonic()
+        matrix = np.asarray(message.data, dtype=np.uint8).reshape(
+            self.message_rows, self.message_columns
+        )
+        with self.lock:
+            previous = self.last_sample_time[finger]
+            if previous is not None and now > previous:
+                measured_rate = 1.0 / (now - previous)
+                old_rate = self.rates[finger]
+                self.rates[finger] = (
+                    measured_rate if old_rate == 0.0
+                    else 0.2 * measured_rate + 0.8 * old_rate
+                )
+            self.last_sample_time[finger] = now
+            self.matrices[finger] = matrix
+
+    def snapshot(self):
+        with self.lock:
+            return (
+                {finger: matrix.copy() for finger, matrix in self.matrices.items()},
+                dict(self.last_sample_time),
+                dict(self.rates),
+            )
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = LinkerHandTactileVisualizer()
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    figure, axes = plt.subplots(1, len(FINGERS), figsize=(13, 6), sharey=True)
+    figure.canvas.manager.set_window_title(
+        f"{node.hand_model.upper()} {node.hand_side.capitalize()} Hand Tactile"
+    )
+    figure.suptitle(
+        f"{node.hand_model.upper()} {node.hand_side.capitalize()} Hand Tactile Matrices"
+    )
+
+    images = {}
+    for axis, finger in zip(axes, FINGERS):
+        images[finger] = axis.imshow(
+            np.zeros((node.rows, node.columns), dtype=np.uint8),
+            cmap="inferno",
+            vmin=0,
+            vmax=node.color_max,
+            origin="upper",
+            interpolation="nearest",
+            aspect="equal",
+        )
+        axis.set_title(f"{FINGER_LABELS[finger]}\nwaiting")
+        axis.set_xlabel("Column")
+        axis.set_xticks(range(node.columns))
+        axis.set_yticks(range(node.rows))
+    axes[0].set_ylabel("Row")
+    figure.colorbar(
+        images[FINGERS[-1]],
+        ax=axes,
+        shrink=0.8,
+        label="Normal force (raw)",
+    )
+
+    def update(_frame):
+        matrices, sample_times, rates = node.snapshot()
+        now = time.monotonic()
+        for finger in FINGERS:
+            images[finger].set_data(matrices[finger])
+            sample_time = sample_times[finger]
+            if sample_time is None:
+                status = "waiting"
+            else:
+                age = now - sample_time
+                status = f"{rates[finger]:.1f} Hz, age {age:.2f}s"
+            images[finger].axes.set_title(
+                f"{FINGER_LABELS[finger]}\n{status}"
+            )
+        return list(images.values())
+
+    animation = FuncAnimation(
+        figure,
+        update,
+        interval=1000.0 / node.refresh_rate,
+        cache_frame_data=False,
+    )
+
+    try:
+        plt.show()
+    finally:
+        # Keep the animation alive until the GUI closes.
+        del animation
+        executor.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        spin_thread.join(timeout=1.0)
+
+
+if __name__ == "__main__":
+    main()
