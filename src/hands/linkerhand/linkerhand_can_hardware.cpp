@@ -16,6 +16,7 @@
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -36,6 +37,12 @@ LinkerHandCanHardware::LinkerHandCanHardware(
   LinkerHandModelConfig config)
 : config_(std::move(config))
 {
+}
+
+LinkerHandCanHardware::~LinkerHandCanHardware()
+{
+  stop_io_thread();
+  close_socket();
 }
 
 hardware_interface::CallbackReturn LinkerHandCanHardware::on_init(
@@ -143,9 +150,24 @@ hardware_interface::CallbackReturn LinkerHandCanHardware::on_activate(
 
   command_sent_ = false;
   tool_settings_pending_.store(true);
-  position_feedback_initialized_ = false;
+  position_feedback_initialized_.store(false);
+  io_position_initialized_ = false;
+  position_request_pending_ = false;
+  tool_setting_phase_ = ToolSettingPhase::kIdle;
   tactile_request_pending_ = false;
+  next_tactile_request_time_ = std::chrono::steady_clock::now();
   tactile_batch_complete_.fill(false);
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    latest_state_ = StateSnapshot{};
+  }
+  consumed_state_sequence_ = 0;
+  last_consumed_state_time_ = SteadyTime{};
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    latest_command_ = CommandSnapshot{};
+  }
+  sent_command_sequence_ = 0;
   for (std::size_t index = 0; index < kFingerCount; ++index) {
     reset_tactile(static_cast<Finger>(index));
   }
@@ -181,12 +203,15 @@ hardware_interface::CallbackReturn LinkerHandCanHardware::on_activate(
     config_.model_name,
     can_interface_.c_str());
 
+  start_io_thread();
+
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn LinkerHandCanHardware::on_deactivate(
   const rclcpp_lifecycle::State & /* previous_state */)
 {
+  stop_io_thread();
   close_socket();
   RCLCPP_INFO(
     rclcpp::get_logger(kLoggerName), "%s CAN hardware deactivated",
@@ -243,40 +268,43 @@ hardware_interface::return_type LinkerHandCanHardware::read(
 
   previous_positions_ = hw_positions_;
 
-  if (read_feedback_ && !send_position_read_request()) {
-    return hardware_interface::return_type::ERROR;
+  StateSnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    snapshot = latest_state_;
   }
 
-  if (read_feedback_ || read_tactile_) {
-    if (!receive_feedback(period)) {
-      return hardware_interface::return_type::ERROR;
+  if (read_feedback_ && snapshot.valid &&
+    snapshot.sequence != consumed_state_sequence_)
+  {
+    hw_positions_ = snapshot.positions;
+    const double feedback_dt = last_consumed_state_time_ == SteadyTime{} ?
+      0.0 :
+      std::chrono::duration<double>(
+      snapshot.timestamp - last_consumed_state_time_).count();
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
+      hw_efforts_[i] = 0.0;
+      hw_velocities_[i] = feedback_dt > std::numeric_limits<double>::epsilon() ?
+        (hw_positions_[i] - previous_positions_[i]) / feedback_dt : 0.0;
     }
-  }
-  if (!read_feedback_) {
+    last_consumed_state_time_ = snapshot.timestamp;
+    consumed_state_sequence_ = snapshot.sequence;
+
+    if (!position_feedback_initialized_.exchange(true)) {
+      hw_commands_ = hw_positions_;
+      RCLCPP_INFO(
+        rclcpp::get_logger(kLoggerName),
+        "Initialized %s commands from asynchronous position feedback",
+        config_.model_name);
+    }
+  } else if (!read_feedback_) {
     hw_positions_ = hw_commands_;
-  }
-
-  // On startup, position must be initialized before applying torque and
-  // velocity limits or starting tactile traffic. Each pending setting is
-  // sent twice by send_pending_tool_settings().
-  if ((!read_feedback_ || position_feedback_initialized_) &&
-    !send_pending_tool_settings())
-  {
-    return hardware_interface::return_type::ERROR;
-  }
-
-  if (read_tactile_ &&
-    (!read_feedback_ || position_feedback_initialized_))
-  {
-    schedule_tactile_request();
-  }
-
-  const double dt = period.seconds();
-  for (std::size_t i = 0; i < config_.joint_count; ++i) {
-    hw_efforts_[i] = 0.0;
-    hw_velocities_[i] = dt > std::numeric_limits<double>::epsilon() ?
-      (hw_positions_[i] - previous_positions_[i]) / dt :
-      0.0;
+    const double dt = period.seconds();
+    for (std::size_t i = 0; i < config_.joint_count; ++i) {
+      hw_efforts_[i] = 0.0;
+      hw_velocities_[i] = dt > std::numeric_limits<double>::epsilon() ?
+        (hw_positions_[i] - previous_positions_[i]) / dt : 0.0;
+    }
   }
 
   return hardware_interface::return_type::OK;
@@ -293,7 +321,7 @@ hardware_interface::return_type LinkerHandCanHardware::write(
   // Wait for the first real position sample before allowing ros2_control to
   // transmit. Otherwise the URDF's zero initial values make the hand jump to
   // zero during startup.
-  if (read_feedback_ && !position_feedback_initialized_) {
+  if (read_feedback_ && !position_feedback_initialized_.load()) {
     return hardware_interface::return_type::OK;
   }
 
@@ -309,16 +337,11 @@ hardware_interface::return_type LinkerHandCanHardware::write(
       radians_to_raw(hw_commands_[ros_index], ros_index);
   }
 
-  if (command_sent_ && !raw_command_changed(raw_command)) {
-    return hardware_interface::return_type::OK;
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    latest_command_.raw = raw_command;
+    ++latest_command_.sequence;
   }
-
-  if (!send_command(raw_command)) {
-    return hardware_interface::return_type::ERROR;
-  }
-
-  last_raw_command_ = raw_command;
-  command_sent_ = true;
 
   if (!read_feedback_) {
     hw_positions_ = hw_commands_;
@@ -345,10 +368,10 @@ void LinkerHandCanHardware::load_parameters()
   send_initial_command_ = parse_bool(
     get_parameter("send_initial_command", send_initial_command_ ? "true" : "false"),
     send_initial_command_);
-  feedback_timeout_ms_ = std::max(0,
-      parse_int(get_parameter("feedback_timeout_ms", "1"), feedback_timeout_ms_));
   tactile_timeout_ms_ = std::max(
     1, parse_int(get_parameter("tactile_timeout_ms", "100"), tactile_timeout_ms_));
+  tactile_period_ms_ = std::max(
+    1, parse_int(get_parameter("tactile_period_ms", "20"), tactile_period_ms_));
   command_deadband_raw_ = std::clamp(parse_int(get_parameter("command_deadband_raw", "0"), 0), 0,
       255);
 
@@ -526,6 +549,20 @@ bool LinkerHandCanHardware::open_socket()
     return false;
   }
 
+  struct can_filter filter;
+  filter.can_id = can_id_;
+  filter.can_mask = CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG;
+  if (setsockopt(
+      socket_fd_, SOL_CAN_RAW, CAN_RAW_FILTER, &filter, sizeof(filter)) < 0)
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLoggerName),
+      "Failed to set CAN filter for ID 0x%X: %s",
+      can_id_, std::strerror(errno));
+    close_socket();
+    return false;
+  }
+
   RCLCPP_INFO(
     rclcpp::get_logger(kLoggerName),
     "Opened SocketCAN interface %s for CAN ID 0x%X",
@@ -543,13 +580,110 @@ void LinkerHandCanHardware::close_socket()
   }
 }
 
-bool LinkerHandCanHardware::receive_feedback(const rclcpp::Duration & period)
+void LinkerHandCanHardware::start_io_thread()
 {
-  const auto deadline = std::chrono::steady_clock::now() +
-    std::chrono::milliseconds(feedback_timeout_ms_);
-  bool processed_position_frame = false;
+  stop_io_.store(false);
+  io_thread_ = std::thread(&LinkerHandCanHardware::io_loop, this);
+}
 
-  while (true) {
+void LinkerHandCanHardware::stop_io_thread()
+{
+  stop_io_.store(true);
+  if (io_thread_.joinable()) {
+    io_thread_.join();
+  }
+}
+
+void LinkerHandCanHardware::io_loop()
+{
+  constexpr auto kPositionPeriod = std::chrono::milliseconds(20);
+  constexpr auto kPositionTimeout = std::chrono::milliseconds(40);
+  auto next_position_request = std::chrono::steady_clock::now();
+  io_position_initialized_ = !read_feedback_;
+
+  while (!stop_io_.load()) {
+    const auto now = std::chrono::steady_clock::now();
+
+    if (read_feedback_ && now >= next_position_request) {
+      if (!position_request_pending_ || now - position_request_time_ >= kPositionTimeout) {
+        if (send_position_read_request()) {
+          position_request_pending_ = true;
+          position_request_time_ = now;
+        }
+      }
+      do {
+        next_position_request += kPositionPeriod;
+      } while (next_position_request <= now);
+    }
+
+    if (io_position_initialized_) {
+      process_pending_tool_settings(now);
+      const bool tool_settings_ready =
+        tool_setting_phase_ == ToolSettingPhase::kIdle &&
+        !tool_settings_pending_.load();
+      if (read_tactile_ && tool_settings_ready) {
+        schedule_tactile_request();
+      }
+
+      CommandSnapshot command;
+      {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        command = latest_command_;
+      }
+      if (tool_settings_ready && command.sequence != 0 &&
+        command.sequence != sent_command_sequence_)
+      {
+        if (!command_sent_ || raw_command_changed(command.raw)) {
+          if (send_command(command.raw)) {
+            last_raw_command_ = command.raw;
+            command_sent_ = true;
+          }
+        }
+        sent_command_sequence_ = command.sequence;
+      }
+    }
+
+    struct pollfd descriptor;
+    descriptor.fd = socket_fd_;
+    descriptor.events = POLLIN;
+    descriptor.revents = 0;
+    const auto before_poll = std::chrono::steady_clock::now();
+    auto wake_time = before_poll + std::chrono::milliseconds(5);
+    if (read_feedback_) {
+      wake_time = std::min(wake_time, next_position_request);
+    }
+    if (tool_setting_phase_ != ToolSettingPhase::kIdle) {
+      wake_time = std::min(wake_time, next_tool_setting_time_);
+    }
+    if (read_tactile_) {
+      const auto tactile_wake_time = tactile_request_pending_ ?
+        tactile_request_time_ + std::chrono::milliseconds(tactile_timeout_ms_) :
+        next_tactile_request_time_;
+      wake_time = std::min(wake_time, tactile_wake_time);
+    }
+    const int poll_timeout_ms = static_cast<int>(std::clamp<int64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        wake_time - before_poll).count(), 0, 5));
+    const int poll_result = ::poll(&descriptor, 1, poll_timeout_ms);
+    if (poll_result > 0 && (descriptor.revents & POLLIN) != 0) {
+      if (!drain_feedback()) {
+        break;
+      }
+    } else if (poll_result < 0 && errno != EINTR) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger(kLoggerName),
+        "Failed to poll CAN interface %s: %s",
+        can_interface_.c_str(), std::strerror(errno));
+      break;
+    }
+  }
+}
+
+bool LinkerHandCanHardware::drain_feedback()
+{
+  constexpr std::size_t kMaxFramesPerDrain = 128;
+
+  for (std::size_t frame_index = 0; frame_index < kMaxFramesPerDrain; ++frame_index) {
     struct can_frame frame;
     const auto bytes_read = ::read(socket_fd_, &frame, sizeof(frame));
 
@@ -566,42 +700,37 @@ bool LinkerHandCanHardware::receive_feedback(const rclcpp::Duration & period)
         frame.can_dlc >= config_.joint_count + 1 &&
         frame.data[0] == kAngleCommand)
       {
+        StateSnapshot snapshot;
         for (std::size_t protocol_index = 0;
           protocol_index < config_.joint_count; ++protocol_index)
         {
           const auto ros_index = config_.protocol_to_ros[protocol_index];
-          hw_positions_[ros_index] = raw_to_radians(
+          snapshot.positions[ros_index] = raw_to_radians(
             frame.data[protocol_index + 1], ros_index);
         }
-        if (!position_feedback_initialized_) {
-          // Seed both the command and velocity baseline from hardware. The
-          // controller therefore starts by holding the measured pose.
-          hw_commands_ = hw_positions_;
-          previous_positions_ = hw_positions_;
-          hw_velocities_.fill(0.0);
+        snapshot.timestamp = std::chrono::steady_clock::now();
+        snapshot.valid = true;
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          snapshot.sequence = latest_state_.sequence + 1;
+          latest_state_ = snapshot;
+        }
+        if (!io_position_initialized_) {
           for (std::size_t protocol_index = 0;
             protocol_index < config_.joint_count; ++protocol_index)
           {
             last_raw_command_[protocol_index] =
               frame.data[protocol_index + 1];
           }
-          position_feedback_initialized_ = true;
-          RCLCPP_INFO(
-            rclcpp::get_logger(kLoggerName),
-            "Initialized %s commands from the first position feedback frame",
-            config_.model_name);
+          io_position_initialized_ = true;
         }
-        processed_position_frame = true;
+        position_request_pending_ = false;
       }
       continue;
     }
 
     if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      if (feedback_timeout_ms_ == 0 || std::chrono::steady_clock::now() >= deadline) {
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      continue;
+      break;
     }
 
     if (bytes_read < 0 && errno == EINTR) {
@@ -617,15 +746,6 @@ bool LinkerHandCanHardware::receive_feedback(const rclcpp::Duration & period)
     }
 
     break;
-  }
-
-  if (!processed_position_frame && period.seconds() > 0.0) {
-    RCLCPP_DEBUG_THROTTLE(
-      rclcpp::get_logger(kLoggerName),
-      *get_node()->get_clock(),
-      2000,
-      "No %s CAN feedback frame received for CAN ID 0x%X",
-      config_.model_name, can_id_);
   }
 
   return true;
@@ -686,6 +806,10 @@ void LinkerHandCanHardware::schedule_tactile_request()
     tactile_request_pending_ = false;
   }
 
+  if (now < next_tactile_request_time_) {
+    return;
+  }
+
   tactile_batch_complete_.fill(false);
   for (std::size_t index = 0; index < kFingerCount; ++index) {
     reset_tactile(static_cast<Finger>(index));
@@ -696,6 +820,8 @@ void LinkerHandCanHardware::schedule_tactile_request()
     }
   }
   tactile_request_time_ = now;
+  next_tactile_request_time_ = now +
+    std::chrono::milliseconds(tactile_period_ms_);
   tactile_request_pending_ = true;
 }
 
@@ -851,51 +977,56 @@ bool LinkerHandCanHardware::send_joint_setting(
   return true;
 }
 
-bool LinkerHandCanHardware::send_pending_tool_settings()
+void LinkerHandCanHardware::process_pending_tool_settings(SteadyTime now)
 {
-  if (!tool_settings_pending_.exchange(false)) {
-    return true;
-  }
-
   const auto to_raw = [](double scale) {
       return static_cast<uint8_t>(
         std::lround(std::clamp(scale, 0.0, 1.0) * 255.0));
     };
-  std::array<uint8_t, kMaxJointCount> torques{};
-  std::array<uint8_t, kMaxJointCount> velocities{};
-  torques.fill(to_raw(tool_torque_scale_.load()));
-  velocities.fill(to_raw(tool_velocity_scale_.load()));
-
-  if (!send_joint_setting(kMaxTorqueCommand, torques)) {
-    tool_settings_pending_.store(true);
-    return false;
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(6));
-  if (!send_joint_setting(kMaxTorqueCommand, torques)) {
-    tool_settings_pending_.store(true);
-    return false;
-  }
-
-  // The LinkerHand vendor implementation sends each setting twice. A single
-  // speed frame can be lost when it is adjacent to another request, even
-  // though SocketCAN accepted the write. The vendor loop has a 1 ms pre-send
-  // delay plus send_frame()'s 5 ms delay, so preserve the effective 6 ms gap.
-  if (!send_joint_setting(kMaxVelocityCommand, velocities)) {
-    tool_settings_pending_.store(true);
-    return false;
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(6));
-  if (!send_joint_setting(kMaxVelocityCommand, velocities)) {
-    tool_settings_pending_.store(true);
-    return false;
+  if (tool_setting_phase_ == ToolSettingPhase::kIdle) {
+    if (!tool_settings_pending_.exchange(false)) {
+      return;
+    }
+    pending_tool_torques_.fill(to_raw(tool_torque_scale_.load()));
+    pending_tool_velocities_.fill(to_raw(tool_velocity_scale_.load()));
+    if (!send_joint_setting(kMaxTorqueCommand, pending_tool_torques_)) {
+      tool_settings_pending_.store(true);
+      return;
+    }
+    next_tool_setting_time_ = now + std::chrono::milliseconds(6);
+    tool_setting_phase_ = ToolSettingPhase::kWaitTorqueSecond;
+    return;
   }
 
+  if (now < next_tool_setting_time_) {
+    return;
+  }
+
+  if (tool_setting_phase_ == ToolSettingPhase::kWaitTorqueSecond) {
+    if (!send_joint_setting(kMaxTorqueCommand, pending_tool_torques_) ||
+      !send_joint_setting(kMaxVelocityCommand, pending_tool_velocities_))
+    {
+      tool_settings_pending_.store(true);
+      tool_setting_phase_ = ToolSettingPhase::kIdle;
+      return;
+    }
+    next_tool_setting_time_ = now + std::chrono::milliseconds(6);
+    tool_setting_phase_ = ToolSettingPhase::kWaitVelocitySecond;
+    return;
+  }
+
+  if (!send_joint_setting(kMaxVelocityCommand, pending_tool_velocities_)) {
+    tool_settings_pending_.store(true);
+    tool_setting_phase_ = ToolSettingPhase::kIdle;
+    return;
+  }
+
+  tool_setting_phase_ = ToolSettingPhase::kIdle;
   RCLCPP_INFO(
     rclcpp::get_logger(kLoggerName),
-    "Applied %s %s tool limits: torque=%u, velocity=%u",
+    "Applied %s %s tool limits asynchronously: torque=%u, velocity=%u",
     config_.model_name, hand_side_.c_str(),
-    torques.front(), velocities.front());
-  return true;
+    pending_tool_torques_.front(), pending_tool_velocities_.front());
 }
 
 uint8_t LinkerHandCanHardware::radians_to_raw(double radians, std::size_t joint_index) const
