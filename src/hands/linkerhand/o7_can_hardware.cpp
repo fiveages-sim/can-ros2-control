@@ -16,7 +16,6 @@ constexpr LinkerHandModelConfig kO7Config{
   12,
   6,
   {0.58, 1.92, 1.13, 1.36, 1.36, 1.36, 1.36},
-  false,
 };
 }  // namespace
 

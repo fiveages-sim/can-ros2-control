@@ -73,6 +73,13 @@ hardware_interface::CallbackReturn LinkerHandCanHardware::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
+  export_effort_ = std::any_of(
+    info_.joints.front().state_interfaces.begin(),
+    info_.joints.front().state_interfaces.end(),
+    [](const auto & interface) {
+      return interface.name == hardware_interface::HW_IF_EFFORT;
+    });
+
   load_parameters();
 
   if (can_interface_.empty() ||
@@ -223,7 +230,7 @@ std::vector<hardware_interface::StateInterface::ConstSharedPtr>
 LinkerHandCanHardware::on_export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface::ConstSharedPtr> state_interfaces;
-  state_interfaces.reserve(config_.joint_count * (config_.export_effort ? 3 : 2));
+  state_interfaces.reserve(config_.joint_count * (export_effort_ ? 3 : 2));
 
   for (std::size_t i = 0; i < config_.joint_count; ++i) {
     state_interfaces.push_back(
@@ -232,7 +239,7 @@ LinkerHandCanHardware::on_export_state_interfaces()
     state_interfaces.push_back(
       std::make_shared<hardware_interface::StateInterface>(
         joint_names_[i], hardware_interface::HW_IF_VELOCITY, &hw_velocities_[i]));
-    if (config_.export_effort) {
+    if (export_effort_) {
       state_interfaces.push_back(
         std::make_shared<hardware_interface::StateInterface>(
           joint_names_[i], hardware_interface::HW_IF_EFFORT,
@@ -471,6 +478,8 @@ rcl_interfaces::msg::SetParametersResult LinkerHandCanHardware::on_tool_paramete
 
 bool LinkerHandCanHardware::validate_joint_interfaces() const
 {
+  bool expected_effort = false;
+  bool effort_initialized = false;
   for (const auto & joint : info_.joints) {
     if (joint.command_interfaces.size() != 1 ||
       joint.command_interfaces[0].name != hardware_interface::HW_IF_POSITION)
@@ -489,16 +498,21 @@ bool LinkerHandCanHardware::validate_joint_interfaces() const
           [&interface_name](const auto & interface) {return interface.name == interface_name;});
       };
 
+    const bool has_effort =
+      has_state_interface(hardware_interface::HW_IF_EFFORT);
+    if (!effort_initialized) {
+      expected_effort = has_effort;
+      effort_initialized = true;
+    }
+
     if (!has_state_interface(hardware_interface::HW_IF_POSITION) ||
       !has_state_interface(hardware_interface::HW_IF_VELOCITY) ||
-      (config_.export_effort &&
-      !has_state_interface(hardware_interface::HW_IF_EFFORT)) ||
-      (!config_.export_effort &&
-      has_state_interface(hardware_interface::HW_IF_EFFORT)))
+      has_effort != expected_effort)
     {
       RCLCPP_ERROR(
         rclcpp::get_logger(kLoggerName),
-        "Joint '%s' has state interfaces incompatible with %s",
+        "Joint '%s' must expose position and velocity state interfaces, "
+        "with effort declared consistently for all %s joints",
         joint.name.c_str(), config_.model_name);
       return false;
     }

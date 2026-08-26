@@ -33,7 +33,6 @@ struct LinkerHandModelConfig
   std::size_t tactile_frame_count;
   std::size_t tactile_values_per_frame;
   std::array<double, 7> upper_limits;
-  bool export_effort;
 };
 
 class LinkerHandCanHardware : public hardware_interface::SystemInterface
@@ -153,6 +152,7 @@ private:
   bool read_feedback_ = true;
   bool read_tactile_ = false;
   bool send_initial_command_ = false;
+  bool export_effort_ = false;
   int tactile_timeout_ms_ = 100;
   int tactile_period_ms_ = 20;
   int command_deadband_raw_ = 0;
