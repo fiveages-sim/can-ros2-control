@@ -647,11 +647,13 @@ void LinkerHandCanHardware::io_loop()
       if (tool_settings_ready && command.sequence != 0 &&
         command.sequence != sent_command_sequence_)
       {
-        if (!command_sent_ || raw_command_changed(command.raw)) {
-          if (send_command(command.raw)) {
-            last_raw_command_ = command.raw;
-            command_sent_ = true;
-          }
+        // ros2_control updates this snapshot at the hardware rw_rate (50 Hz).
+        // Always retransmit the latest target: SocketCAN write success does not
+        // acknowledge reception by the hand, so suppressing unchanged commands
+        // can leave the hand stuck forever after a single lost CAN frame.
+        if (send_command(command.raw)) {
+          last_raw_command_ = command.raw;
+          command_sent_ = true;
         }
         sent_command_sequence_ = command.sequence;
       }

@@ -193,7 +193,7 @@ cansend can0 027#B1C6
 | | `feedback_timeout_ms` | — | LinkerHand 读取为非阻塞；旧配置中的该参数会被忽略 |
 | | `tactile_timeout_ms` | `100` | 触觉批次超时后重新发起五指请求 |
 | | `tactile_period_ms` | `20` | 触觉批次最小周期，默认 20 ms（50 Hz） |
-| | `command_deadband_raw` | `0` | 0–255 |
+| | `command_deadband_raw` | `0` | 兼容旧配置保留；位置目标现在固定按硬件 `rw_rate` 重发，不再据此抑制发送 |
 | | `left_tool_torque` / `right_tool_torque` | `1.0` | 按 `hand_side` 声明对应参数；运行时设置最大扭矩，归一化到 0–255 |
 | | `left_tool_velocity` / `right_tool_velocity` | `1.0` | 按 `hand_side` 声明对应参数；运行时设置最大速度，归一化到 0–255 |
 | **FreedomCanHardware** | `can_interface` | `can0` | |
@@ -212,7 +212,8 @@ cansend can0 027#B1C6
 三款 LinkerHand 使用独立 I/O 线程异步收发。`read()` / `write()` 仅交换最新状态和
 命令缓存，不等待 CAN 响应。启动时先读取实际位置，再按以下顺序配置：力矩帧 `0x02`
 发送两次、速度帧 `0x05` 发送两次；两组重复帧间隔 6 ms，但不会阻塞 ros2_control
-更新线程。不发送加速度配置帧。
+更新线程。不发送加速度配置帧。完成初始化后，最新位置目标会按硬件
+`rw_rate` 周期重发；M6 CCS 全身配置中 `rw_rate="50"`，即每只手 50 Hz。
 
 ## 5. 协议与位置单位
 
