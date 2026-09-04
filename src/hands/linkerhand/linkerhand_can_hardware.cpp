@@ -175,6 +175,10 @@ hardware_interface::CallbackReturn LinkerHandCanHardware::on_activate(
     latest_command_ = CommandSnapshot{};
   }
   sent_command_sequence_ = 0;
+  can_write_backoff_until_ = SteadyTime{};
+  last_can_write_error_log_ = SteadyTime{};
+  suppressed_can_write_errors_ = 0;
+  can_write_failed_ = false;
   for (std::size_t index = 0; index < kFingerCount; ++index) {
     reset_tactile(static_cast<Finger>(index));
   }
@@ -775,16 +779,7 @@ bool LinkerHandCanHardware::send_position_read_request()
   frame.can_dlc = 1;
   frame.data[0] = kAngleCommand;
 
-  if (::write(socket_fd_, &frame, sizeof(frame)) !=
-    static_cast<ssize_t>(sizeof(frame)))
-  {
-    RCLCPP_ERROR(
-      rclcpp::get_logger(kLoggerName),
-      "Failed to write %s position request to ID 0x%X: %s",
-      config_.model_name, can_id_, std::strerror(errno));
-    return false;
-  }
-  return true;
+  return write_can_frame(frame, "position request");
 }
 
 bool LinkerHandCanHardware::send_tactile_request(Finger finger)
@@ -797,17 +792,7 @@ bool LinkerHandCanHardware::send_tactile_request(Finger finger)
   frame.can_dlc = request.dlc;
   std::copy_n(request.data.begin(), request.dlc, frame.data);
 
-  if (::write(socket_fd_, &frame, sizeof(frame)) !=
-    static_cast<ssize_t>(sizeof(frame)))
-  {
-    RCLCPP_ERROR(
-      rclcpp::get_logger(kLoggerName),
-      "Failed to write %s tactile request 0x%02X to ID 0x%X: %s",
-      config_.model_name, request.data[0], request.can_id,
-      std::strerror(errno));
-    return false;
-  }
-  return true;
+  return write_can_frame(frame, "tactile request");
 }
 
 void LinkerHandCanHardware::schedule_tactile_request()
@@ -958,18 +943,7 @@ bool LinkerHandCanHardware::send_command(const std::array<uint8_t, kMaxJointCoun
     frame.data[i + 1] = raw_command[i];
   }
 
-  const auto bytes_written = ::write(socket_fd_, &frame, sizeof(frame));
-  if (bytes_written != static_cast<ssize_t>(sizeof(frame))) {
-    RCLCPP_ERROR(
-      rclcpp::get_logger(kLoggerName),
-      "Failed to write %s CAN command to ID 0x%X: %s",
-      config_.model_name,
-      can_id_,
-      std::strerror(errno));
-    return false;
-  }
-
-  return true;
+  return write_can_frame(frame, "CAN command");
 }
 
 bool LinkerHandCanHardware::send_joint_setting(
@@ -982,15 +956,53 @@ bool LinkerHandCanHardware::send_joint_setting(
   frame.data[0] = command;
   std::copy_n(values.begin(), config_.joint_count, frame.data + 1);
 
-  const auto bytes_written = ::write(socket_fd_, &frame, sizeof(frame));
-  if (bytes_written != static_cast<ssize_t>(sizeof(frame))) {
-    RCLCPP_ERROR(
-      rclcpp::get_logger(kLoggerName),
-      "Failed to write %s setting 0x%02X to ID 0x%X: %s",
-      config_.model_name, command, can_id_, std::strerror(errno));
+  return write_can_frame(frame, "joint setting");
+}
+
+bool LinkerHandCanHardware::write_can_frame(
+  const struct can_frame & frame, const char * operation)
+{
+  constexpr auto kQueueFullBackoff = std::chrono::milliseconds(100);
+  constexpr auto kErrorLogPeriod = std::chrono::seconds(2);
+  const auto now = std::chrono::steady_clock::now();
+
+  if (now < can_write_backoff_until_) {
+    ++suppressed_can_write_errors_;
     return false;
   }
-  return true;
+
+  const auto bytes_written = ::write(socket_fd_, &frame, sizeof(frame));
+  if (bytes_written == static_cast<ssize_t>(sizeof(frame))) {
+    if (can_write_failed_) {
+      RCLCPP_INFO(
+        rclcpp::get_logger(kLoggerName),
+        "%s CAN writes recovered on %s (suppressed %llu repeated failures)",
+        config_.model_name, can_interface_.c_str(),
+        static_cast<unsigned long long>(suppressed_can_write_errors_));
+      can_write_failed_ = false;
+      suppressed_can_write_errors_ = 0;
+    }
+    return true;
+  }
+
+  const int write_errno = bytes_written < 0 ? errno : EIO;
+  if (write_errno == ENOBUFS || write_errno == EAGAIN || write_errno == EWOULDBLOCK) {
+    can_write_backoff_until_ = now + kQueueFullBackoff;
+  }
+
+  ++suppressed_can_write_errors_;
+  if (!can_write_failed_ || now - last_can_write_error_log_ >= kErrorLogPeriod) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLoggerName),
+      "Failed to write %s %s to ID 0x%X on %s: %s "
+      "(%llu failures since last recovery; further errors throttled)",
+      config_.model_name, operation, can_id_, can_interface_.c_str(),
+      std::strerror(write_errno),
+      static_cast<unsigned long long>(suppressed_can_write_errors_));
+    last_can_write_error_log_ = now;
+  }
+  can_write_failed_ = true;
+  return false;
 }
 
 void LinkerHandCanHardware::process_pending_tool_settings(SteadyTime now)

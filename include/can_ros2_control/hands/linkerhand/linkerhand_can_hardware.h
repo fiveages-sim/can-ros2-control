@@ -100,6 +100,7 @@ private:
   bool send_command(const std::array<uint8_t, kMaxJointCount>& raw_command);
   bool send_joint_setting(
     uint8_t command, const std::array<uint8_t, kMaxJointCount>& values);
+  bool write_can_frame(const struct can_frame& frame, const char* operation);
   void process_pending_tool_settings(SteadyTime now);
   bool send_tactile_request(Finger finger);
   void schedule_tactile_request();
@@ -175,6 +176,10 @@ private:
   CommandSnapshot latest_command_;
   uint64_t sent_command_sequence_ = 0;
   bool command_sent_ = false;
+  SteadyTime can_write_backoff_until_{};
+  SteadyTime last_can_write_error_log_{};
+  uint64_t suppressed_can_write_errors_ = 0;
+  bool can_write_failed_ = false;
   std::atomic_bool position_feedback_initialized_{false};
   bool io_position_initialized_ = false;
   bool position_request_pending_ = false;
